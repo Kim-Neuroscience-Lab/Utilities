@@ -1,4 +1,4 @@
-# src/core/exceptions/performance.py
+# src/core/exceptions/utils/performance.py
 """
 Exceptions for performance-related errors.
 

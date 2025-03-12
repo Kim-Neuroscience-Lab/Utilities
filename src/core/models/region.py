@@ -1,4 +1,5 @@
 # src/core/models/region.py
+"""Region model."""
 
 # Standard Library Imports
 from uuid import uuid4, UUID
@@ -11,7 +12,7 @@ from pydantic import BaseModel, Field
 # Internal Imports
 from src.core.models.segment import Segment
 from src.utils.logging import get_logger
-from Utilities.src.core.exceptions.models.region import *
+from src.core.exceptions.models.region import *
 
 # Initialize logger
 logger: Logger = get_logger(__name__)

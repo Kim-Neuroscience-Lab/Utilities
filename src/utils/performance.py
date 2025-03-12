@@ -16,16 +16,17 @@ import math
 # Internal Imports
 from src.utils.logging import get_logger
 from src.utils.hardware import get_system_info
-from Utilities.src.core.exceptions.utils.hardware import NoGPUAvailable
-from Utilities.src.core.exceptions.utils.performance import MemoryFractionError
+from src.core.exceptions.utils.hardware import NoGPUAvailable
+from src.core.exceptions.utils.performance import MemoryFractionError
 from src.utils.constants import (
+    GPU_MEMORY_FRACTION,
+    MEMORY_THRESHOLD_MB,
     MB_IN_BYTES,
-    GB_IN_BYTES,
+    GPU_BACKEND,
     DEFAULT_BUFFER_SIZE,
     DEFAULT_MAX_BUFFER,
     DEFAULT_MEMORY_FRACTION,
     SAFETY_MARGIN,
-    GPUBackend,
     HardwareKeys as HK,
 )
 

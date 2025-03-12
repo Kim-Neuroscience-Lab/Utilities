@@ -20,6 +20,16 @@ MIN_MEMORY_THRESHOLD_MB: Final[float] = MIN_MEMORY_THRESHOLD_BYTES / MB_IN_BYTES
 MIN_MEMORY_THRESHOLD_GB: Final[float] = MIN_MEMORY_THRESHOLD_MB / 1024
 MIN_MEMORY_THRESHOLD_TB: Final[float] = MIN_MEMORY_THRESHOLD_GB / 1024
 
+# Memory constants
+MEMORY_THRESHOLD_MB: Final[int] = 1024  # 1GB
+DEFAULT_BUFFER_SIZE: Final[int] = 8 * MB_IN_BYTES
+DEFAULT_MAX_BUFFER: Final[int] = 128 * MB_IN_BYTES
+DEFAULT_MEMORY_FRACTION: Final[float] = 0.8
+MAX_GPU_MEMORY_USAGE: Final[float] = 0.8  # Maximum fraction of GPU memory to use
+GPU_MEMORY_FRACTION: Final[float] = 0.7  # Target fraction of GPU memory for processing
+SAFETY_MARGIN: Final[float] = 0.1
+BUFFER_SIZE: Final[int] = DEFAULT_BUFFER_SIZE
+
 
 # Hardware constants
 class GPUBackend(str, Enum):
@@ -46,8 +56,14 @@ class HardwareKeys(str, Enum):
     TOTAL = "total"
 
 
-# Default values
-DEFAULT_BUFFER_SIZE: Final[int] = MB_IN_BYTES
-DEFAULT_MAX_BUFFER: Final[int] = GB_IN_BYTES
-DEFAULT_MEMORY_FRACTION: Final[float] = 0.8
-SAFETY_MARGIN: Final[float] = 0.9  # 90% of calculated optimal size
+# Processing constants
+BATCH_SIZE: Final[int] = 32  # Optimal batch size for general processing
+GPU_BATCH_SIZE: Final[int] = 16  # Optimal batch size for GPU processing
+ROI_SIZE_THRESHOLD: Final[int] = (
+    500000  # Threshold for GPU vs fast method (reduced for better GPU utilization)
+)
+GPU_MEMORY_THRESHOLD: Final[int] = (
+    1024 * 1024 * 1024
+)  # 1GB minimum GPU memory for batch processing
+
+GPU_BACKEND = GPUBackend

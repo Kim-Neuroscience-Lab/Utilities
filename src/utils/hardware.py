@@ -26,12 +26,12 @@ from enum import Enum, auto
 
 # Internal Imports
 from src.utils.logging import get_logger
-from Utilities.src.core.exceptions.utils.hardware import *
+from src.core.exceptions.utils.hardware import *
 from src.utils.constants import (
-    MIN_MEMORY_THRESHOLD_MB,
+    GPU_MEMORY_FRACTION,
+    MEMORY_THRESHOLD_MB,
     MB_IN_BYTES,
-    GB_IN_BYTES,
-    GPUBackend,
+    GPU_BACKEND,
     HardwareKeys as HK,
 )
 
@@ -43,8 +43,8 @@ def detect_gpu_backend() -> Tuple[Optional[str], Optional[Any]]:
     """Detect available GPU backend based on platform and hardware.
 
     Attempts to detect and initialize GPU backends in the following order:
-    1. CUDA (via CuPy) for NVIDIA GPUs
-    2. Metal Performance Shaders (MPS) for Apple Silicon
+    1. Metal Performance Shaders (MPS) for Apple Silicon
+    2. CUDA (via CuPy) for NVIDIA GPUs
 
     Returns:
         Tuple[Optional[str], Optional[Any]]: A tuple containing:
@@ -59,25 +59,33 @@ def detect_gpu_backend() -> Tuple[Optional[str], Optional[Any]]:
     machine: str = platform.machine()
 
     try:
-        # Try CuPy first (NVIDIA GPUs)
-        try:
-            import cupy as cp  # type: ignore
-
-            logger.info("CUDA GPU detected via CuPy")
-            return GPUBackend.CUDA.value, cp
-        except ImportError:
-            logger.debug("CuPy not available")
-
-        # Try Metal Performance Shaders (Apple Silicon)
+        # Try Metal Performance Shaders first on Apple Silicon
         if system == "Darwin" and machine == "arm64":
             try:
                 import torch
 
-                if torch.backends.mps.is_available():
-                    logger.info("Apple Silicon GPU detected via MPS")
-                    return GPUBackend.MPS.value, torch
+                if torch.backends.mps.is_built() and torch.backends.mps.is_available():
+                    # Test MPS with a small tensor operation
+                    try:
+                        device = torch.device("mps")
+                        test_tensor = torch.ones(1, device=device)
+                        del test_tensor
+                        torch.mps.empty_cache()  # Clean up
+                        logger.info("Apple Silicon GPU detected via MPS")
+                        return "mps", torch
+                    except Exception as e:
+                        logger.debug(f"MPS test failed: {str(e)}")
             except ImportError:
                 logger.debug("PyTorch MPS not available")
+
+        # Try CuPy for NVIDIA GPUs
+        try:
+            import cupy as cp
+
+            logger.info("CUDA GPU detected via CuPy")
+            return "cuda", cp
+        except ImportError:
+            logger.debug("CuPy not available")
 
         logger.info("No GPU backend detected")
         return None, None

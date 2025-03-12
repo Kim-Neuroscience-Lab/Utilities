@@ -1,4 +1,4 @@
-# src/kim_lab_tools/application/use_cases/analyzers/roi_area_analyzer.py
+# src/analysis/roi_area_analyzer.py
 """
 ROI Area Analyzer module for computing areas of regions of interest from pickle files.
 
@@ -11,8 +11,11 @@ import os
 import sys
 import platform
 import pickle
+import logging
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
+import time
+from datetime import datetime
 
 # Third Party Imports
 from logging import Logger
@@ -24,44 +27,29 @@ import pandas as pd
 from pandas import DataFrame
 from scipy import sparse
 from tqdm import tqdm
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
 
 # Internal Imports
 from src.utils.hardware import detect_gpu_backend
 from src.utils.logging import get_logger
 from src.utils.performance import batch_process, timed_execution
-from src.utils.constants import MB_IN_BYTES
+from src.utils.constants import (
+    MB_IN_BYTES,
+    ROI_SIZE_THRESHOLD,
+    BATCH_SIZE,
+    BUFFER_SIZE,
+)
 from src.core.models.animal import Animal
+from src.analysis.area_analyzer import AreaAnalyzer
 
-# Configure logging
-logger: Logger = get_logger(__name__)
-
-
-class AreaAnalyzer(BaseModel):
-    class Config:
-        batch_size: int = Field(
-            default=1, ge=1, description="Number of files to process in a single batch"
-        )
-        buffer_size: int = Field(
-            default=MB_IN_BYTES, ge=1, description="Buffer size for reading files"
-        )
-        device: str = Field(
-            default="cpu",
-            description="Device to use for processing.",
-            examples=["cpu", "gpu", "mps"],
-        )
-
-        def __post_init__(self):
-            logger.info(
-                f"Initialized AreaAnalyzer with batch size {self.batch_size},"
-                + f"buffer size {self.buffer_size},"
-                + f"with device {self.device}"
-            )
-
-    config: Config = Config()
-    animals: Dict[str, Animal] = Field(
-        default_factory=dict, description="Dictionary of animals"
-    )
+# Configure logger
+logger = logging.getLogger("ROIAreaAnalyzer")
+logger.setLevel(logging.INFO)
+console_handler = logging.StreamHandler()
+console_handler.setFormatter(
+    logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+)
+logger.addHandler(console_handler)
 
 
 @dataclass
@@ -79,7 +67,7 @@ class ROIAreaResult:
     area_pixels: int
 
 
-class ROIAreaAnalyzer:
+class ROIAreaAnalyzer(AreaAnalyzer):
     """Analyzer for computing areas of ROIs from pickle files.
 
     This class provides methods to:
@@ -96,35 +84,26 @@ class ROIAreaAnalyzer:
         gpu_backend: GPU backend to use (cupy, mps, or None)
         gpu_module: GPU module to use (cupy or torch)
         method_counts: Dictionary tracking computation method usage
-        _cache: Dictionary caching processed ROI data
-
-    Methods:
-        __init__: Initialize the ROI area analyzer
-        analyze_directory: Analyze all ROI files in the input directory
-        _compute_roi_area_fast: Compute area by counting non-zero values (fastest method)
-        _compute_roi_area_gpu: Compute area using available GPU acceleration
-        _compute_roi_area_sparse: Compute area using memory-efficient sparse matrix representation
-        _compute_roi_area: Compute area of ROI in pixels using the most appropriate method
-        _parse_filename: Parse ROI filename into components
-        _read_pickle_file: Read pickle file with optimized buffering
-        _process_single_file: Process a single ROI file
-        _process_batch: Process a batch of files in parallel, using GPU batch processing when possible
-        _process_batch_gpu: Process large ROIs on GPU in a single batch
-        _get_file_batches: Get batches of files to process
-        analyze_directory: Analyze all ROI files in the input directory
-        _optimize_dataframe: Optimize DataFrame memory usage
-        get_summary_by_region: Get summary statistics by region
-        get_summary_by_segment: Get summary statistics by segment
-        clear_cache: Clear the cache of processed ROI data
-        get_system_info: Get system information and GPU details
-        _is_valid_roi_file: Check if a file matches the expected ROI file pattern
-        _find_roi_directories: Recursively find directories containing valid ROI files
-        analyze_all_directories: Analyze all directories containing ROI files
+        cache: Dictionary caching processed ROI data
     """
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    # Additional fields
+    gpu_backend: Optional[str] = Field(None, description="GPU backend type")
+    gpu_module: Optional[Any] = Field(None, description="GPU module")
+    method_counts: Dict[str, int] = Field(
+        default_factory=lambda: {"fast": 0, "gpu": 0, "sparse": 0},
+        description="Method usage counters",
+    )
+    cache: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Cache for processed results",
+    )
 
     def __init__(
         self,
-        input_dir: str,
+        input_dir: Union[str, Path],
         max_workers: Optional[int] = None,
         use_gpu: bool = False,
     ) -> None:
@@ -135,37 +114,39 @@ class ROIAreaAnalyzer:
             max_workers: Maximum number of worker threads for parallel processing
             use_gpu: Whether to use GPU acceleration if available
         """
-        self.input_dir: Path = Path(input_dir)
-        self.max_workers: int = (
-            max_workers if max_workers is not None else os.cpu_count()  # type: ignore
+        # Initialize base class first
+        super().__init__(
+            input_dir=str(input_dir),
+            max_workers=max_workers if max_workers is not None else os.cpu_count(),  # type: ignore
+            use_gpu=use_gpu,
         )
-        self._cache: Dict[str, Any] = {}
 
         # GPU initialization
-        self.use_gpu: bool = use_gpu
         if use_gpu:
-            gpu_backend: Optional[str] = None
-            gpu_module: Optional[Any] = None
             gpu_backend, gpu_module = detect_gpu_backend()
-            self.gpu_backend: Optional[str] = gpu_backend
-            self.gpu_module: Optional[Any] = gpu_module
+            self.gpu_backend = gpu_backend
+            self.gpu_module = gpu_module
             if self.gpu_backend:
                 logger.info(f"Using GPU acceleration with {self.gpu_backend}")
-                if self.gpu_backend == "cupy":
-                    device: Any = self.gpu_module.cuda.runtime.getDeviceProperties(0)  # type: ignore
-                    logger.info(f"GPU Device: {device['name'].decode()}")
-                elif self.gpu_backend == "mps":
-                    logger.info("GPU Device: Apple Silicon")
+                self.use_gpu = True
             else:
-                logger.warning("No GPU backend available. Falling back to CPU.")
+                logger.warning("No GPU backend available, falling back to CPU")
                 self.use_gpu = False
         else:
+            logger.info("Using CPU computation (GPU acceleration disabled)")
             self.gpu_backend = None
             self.gpu_module = None
-            logger.info("Using CPU computation (GPU acceleration disabled)")
+            self.use_gpu = False
 
-        # Initialize method tracking
-        self.method_counts: Dict[str, int] = {"fast": 0, "gpu": 0, "sparse": 0}
+    def __hash__(self) -> int:
+        """Make ROIAreaAnalyzer hashable by using input_dir as the hash key."""
+        return hash(str(self.input_dir))
+
+    def __eq__(self, other: object) -> bool:
+        """Define equality for ROIAreaAnalyzer based on input_dir."""
+        if not isinstance(other, ROIAreaAnalyzer):
+            return NotImplemented
+        return str(self.input_dir) == str(other.input_dir)
 
     def _compute_roi_area_fast(
         self,
@@ -362,8 +343,8 @@ class ROIAreaAnalyzer:
         try:
             # Use cached result if available
             cache_key = str(file)
-            if cache_key in self._cache:
-                return self._cache[cache_key]
+            if cache_key in self.cache:
+                return self.cache[cache_key]
 
             # Parse filename first to avoid loading file if filename is invalid
             animal_id: str
@@ -383,189 +364,219 @@ class ROIAreaAnalyzer:
             }
 
             # Cache the result
-            self._cache[cache_key] = result
+            self.cache[cache_key] = result
             return result
 
         except Exception as e:
             logger.error(f"Error processing {file.name}: {str(e)}")
             return None
 
-    def _process_batch(
-        self,
-        files: List[Path],
-    ) -> List[Dict[str, Any]]:
-        """Process a batch of files in parallel, using GPU batch processing when possible.
-
-        Args:
-            files: List of paths to the ROI files
-
-        Returns:
-            List of dictionaries containing processed ROI data
-        """
-        try:
-            # First, load all ROI data
-            roi_data_list: List[Dict[str, Any]] = []
-            file_info_list: List[Tuple[Path, str, str, str]] = []
-
-            for file in files:
-                try:
-                    # Use cached result if available
-                    cache_key = str(file)
-                    if cache_key in self._cache:
-                        return [self._cache[cache_key]]
-
-                    # Parse filename
-                    animal_id: str
-                    segment_id: str
-                    region_name: str
-                    animal_id, segment_id, region_name = self._parse_filename(file.name)
-                    roi_data: Dict[str, Any] = self._read_pickle_file(file)
-
-                    # Store data and file info
-                    roi_data_list.append(roi_data)
-                    file_info_list.append((file, animal_id, segment_id, region_name))
-
-                except Exception as e:
-                    logger.error(f"Error loading {file.name}: {str(e)}")
-                    continue
-
-            if not roi_data_list:
-                return []
-
-            # Process ROIs in batch if they're large enough
-            large_rois: List[Dict[str, Any]] = [
-                roi for roi in roi_data_list if len(roi["roi"]) >= ROI_SIZE_THRESHOLD
-            ]
-            small_rois: List[Dict[str, Any]] = [
-                roi for roi in roi_data_list if len(roi["roi"]) < ROI_SIZE_THRESHOLD
-            ]
-
-            results: List[Dict[str, Any]] = []
-
-            # Process large ROIs in GPU batch if available
-            if large_rois and self.use_gpu:
-                logger.debug(f"Processing {len(large_rois)} large ROIs in GPU batch")
-                areas: List[int] | None = self._process_batch_gpu(large_rois)
-
-                # Match areas with file info
-                for roi_data, area, (file, animal_id, segment_id, region_name) in zip(
-                    large_rois,
-                    areas if areas is not None else [],
-                    file_info_list[: len(large_rois)],
-                ):
-                    result: Dict[str, Any] = {
-                        "animal_id": animal_id,
-                        "segment_id": segment_id,
-                        "region_name": region_name,
-                        "area_pixels": area,
-                        "file_path": str(file),
-                    }
-                    self._cache[str(file)] = result
-                    results.append(result)
-
-            # Process remaining ROIs with regular methods
-            remaining_files: List[Tuple[Path, str, str, str]] = file_info_list[
-                len(large_rois) :
-            ]
-            remaining_rois: List[Dict[str, Any]] = small_rois
-
-            with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-                future_to_roi = {}
-                for roi_data, (file, animal_id, segment_id, region_name) in zip(
-                    remaining_rois, remaining_files
-                ):
-                    future = executor.submit(self._compute_roi_area, roi_data)
-                    future_to_roi[future] = (file, animal_id, segment_id, region_name)
-
-                for future in as_completed(future_to_roi):
-                    try:
-                        area: int = future.result()
-                        file: Path
-                        animal_id: str
-                        segment_id: str
-                        region_name: str
-                        file, animal_id, segment_id, region_name = future_to_roi[future]
-                        result: Dict[str, Any] = {
-                            "animal_id": animal_id,
-                            "segment_id": segment_id,
-                            "region_name": region_name,
-                            "area_pixels": area,
-                            "file_path": str(file),
-                        }
-                        self._cache[str(file)] = result
-                        results.append(result)
-                    except Exception as e:
-                        logger.error(f"Error processing ROI: {str(e)}")
-
-            return results
-
-        except Exception as e:
-            logger.error(f"Batch processing error: {str(e)}")
-            return []
-
     def _process_batch_gpu(
         self,
         roi_data_list: List[Dict[str, Any]],
-    ) -> List[int] | None:
+        batch_size: int = 32,  # Optimal batch size for GPU processing
+    ) -> List[int]:
         """Process multiple ROIs on GPU in a single batch for better efficiency.
 
         Args:
             roi_data_list: List of dictionaries containing ROI data
+            batch_size: Size of mini-batches for GPU processing
 
         Returns:
             List of areas of the ROIs in pixels
         """
+        if not roi_data_list:
+            return []
+
         try:
-            # Extract all values and combine into a single array
-            all_values: List[np.ndarray] = [
-                np.array(list(data["roi"].values()), dtype=np.uint8)
-                for data in roi_data_list
-            ]
-            total_values: int = sum(len(v) for v in all_values)
-            logger.debug(
-                f"Processing batch of {len(roi_data_list)} ROIs with {total_values} total values"
-            )
+            # Pre-allocate memory for results
+            results: List[int] = []
 
-            if self.gpu_backend == "mps":
-                # Process batch on MPS
-                batch_results: List[int] = []
-                values_gpu = None
+            # Process in mini-batches for better memory management
+            for i in range(0, len(roi_data_list), batch_size):
+                batch = roi_data_list[i : i + batch_size]
 
-                for values in all_values:
-                    if values_gpu is None:
-                        values_gpu: Any = self.gpu_module.from_numpy(values).to("mps")  # type: ignore
-                    else:
-                        values_gpu: Any = self.gpu_module.cat(  # type: ignore
-                            [values_gpu, self.gpu_module.from_numpy(values).to("mps")]  # type: ignore
+                # Extract values from batch
+                batch_values: List[np.ndarray] = [
+                    np.array(list(data["roi"].values()), dtype=np.uint8)
+                    for data in batch
+                ]
+
+                if self.gpu_backend == "mps":
+                    try:
+                        # Convert all arrays to tensors at once
+                        tensors = [
+                            self.gpu_module.from_numpy(values).to("mps")  # type: ignore
+                            for values in batch_values
+                        ]
+
+                        # Process each tensor
+                        for tensor in tensors:
+                            mask = tensor > 0
+                            area = int(mask.sum().item())
+                            results.append(area)
+                            # Clean up immediately
+                            del mask
+                            del tensor
+                            # Update method count for each ROI processed
+                            self.method_counts["gpu"] += 1
+
+                        # Clear GPU cache after batch
+                        self.gpu_module.mps.empty_cache()  # type: ignore
+
+                    except Exception as e:
+                        logger.warning(
+                            f"MPS batch processing failed: {str(e)}. Processing individually."
                         )
+                        for data in batch:
+                            area = self._compute_roi_area_gpu(data)
+                            results.append(area)
+                            # Update method count for fallback processing
+                            self.method_counts["gpu"] += 1
 
-                    mask_gpu = values_gpu > 0
-                    area = int(mask_gpu.sum().item())
-                    batch_results.append(area)
+                elif self.gpu_backend == "cupy":
+                    try:
+                        # Process batch on CUDA
+                        for values in batch_values:
+                            # Transfer and process in one go
+                            values_gpu = self.gpu_module.asarray(values)  # type: ignore
+                            area = int(self.gpu_module.count_nonzero(values_gpu))  # type: ignore
+                            results.append(area)
+                            del values_gpu
+                            # Update method count for each ROI processed
+                            self.method_counts["gpu"] += 1
 
-                # Clean up
-                del values_gpu
-                self.gpu_module.mps.empty_cache()  # type: ignore
+                        # Clear GPU memory after batch
+                        self.gpu_module.get_default_memory_pool().free_all_blocks()  # type: ignore
 
-                return batch_results
+                    except Exception as e:
+                        logger.warning(
+                            f"CUDA batch processing failed: {str(e)}. Processing individually."
+                        )
+                        for data in batch:
+                            area = self._compute_roi_area_gpu(data)
+                            results.append(area)
+                            # Update method count for fallback processing
+                            self.method_counts["gpu"] += 1
 
-            elif self.gpu_backend == "cupy":
-                # Process batch on CUDA
-                batch_results: List[int] = []
-                for values in all_values:
-                    values_gpu: Any = self.gpu_module.asarray(values)  # type: ignore
-                    area: int = int(self.gpu_module.count_nonzero(values_gpu))  # type: ignore
-                    batch_results.append(area)
-                    del values_gpu
-
-                self.gpu_module.get_default_memory_pool().free_all_blocks()  # type: ignore
-                return batch_results
+            return results
 
         except Exception as e:
-            logger.warning(
-                f"Batch GPU processing failed: {str(e)}. Processing individually."
+            logger.error(
+                f"Batch GPU processing failed: {str(e)}. Falling back to individual processing."
             )
-            return [self._compute_roi_area_gpu(data) for data in roi_data_list]
+            results = []
+            for data in roi_data_list:
+                area = self._compute_roi_area_gpu(data)
+                results.append(area)
+                # Update method count for fallback processing
+                self.method_counts["gpu"] += 1
+            return results
+
+    def _process_batch(self, batch: List[Path]) -> List[Dict[str, Any]]:
+        """Process a batch of ROI files.
+
+        Args:
+            batch: List of paths to ROI files
+
+        Returns:
+            List of dictionaries containing analysis results
+        """
+        results = []
+        roi_data_list = []
+        file_info_list = []
+
+        # First, load all ROI data and collect file info
+        for file_path in batch:
+            start_time = time.time()
+            file_size = os.path.getsize(file_path) / (1024 * 1024)  # Size in MB
+            logger.info(f"Processing {file_path.name} (Size: {file_size:.2f} MB)")
+
+            try:
+                # Check cache first
+                cache_key = str(file_path)
+                if cache_key in self.cache:
+                    logger.info(f"Using cached results for {file_path.name}")
+                    results.append(self.cache[cache_key])
+                    continue
+
+                # Load ROI data
+                with open(file_path, "rb") as f:
+                    roi_data = pickle.load(f)
+
+                # Get file info
+                animal_id, segment_id, region_name = self._parse_filename(
+                    file_path.name
+                )
+
+                # Store data and info
+                roi_data_list.append(roi_data)
+                file_info_list.append(
+                    (file_path, animal_id, segment_id, region_name, start_time)
+                )
+
+            except Exception as e:
+                logger.error(f"Error loading {file_path.name}: {str(e)}")
+                continue
+
+        if not roi_data_list:
+            return results
+
+        # Determine processing method based on ROI sizes
+        roi_sizes = [len(data["roi"]) for data in roi_data_list]
+        use_gpu_batch = (
+            self.use_gpu
+            and any(size >= ROI_SIZE_THRESHOLD for size in roi_sizes)
+            and len(roi_sizes) > 1  # Only use batch processing for multiple ROIs
+        )
+
+        if use_gpu_batch:
+            # Process batch on GPU
+            try:
+                areas = self._process_batch_gpu(roi_data_list)
+
+                # Create results
+                for (
+                    file_path,
+                    animal_id,
+                    segment_id,
+                    region_name,
+                    start_time,
+                ), area in zip(file_info_list, areas):
+                    result = {
+                        "animal_id": animal_id,
+                        "segment_id": segment_id,
+                        "region_name": region_name,
+                        "area_pixels": area,
+                        "file_path": str(file_path),
+                    }
+                    self.cache[str(file_path)] = result
+                    results.append(result)
+
+                    end_time = time.time()
+                    processing_time = end_time - start_time
+                    logger.info(
+                        f"Completed processing {file_path.name} in {processing_time:.2f} seconds"
+                    )
+
+            except Exception as e:
+                logger.error(
+                    f"GPU batch processing failed: {str(e)}. Processing individually."
+                )
+                # Fall back to individual processing
+                for file_path, animal_id, segment_id, region_name, _ in file_info_list:
+                    result = self._process_single_file(file_path)
+                    if result:
+                        results.append(result)
+
+        else:
+            # Process individually
+            for file_path, animal_id, segment_id, region_name, _ in file_info_list:
+                result = self._process_single_file(file_path)
+                if result:
+                    results.append(result)
+
+        return results
 
     def _get_file_batches(self) -> Iterator[List[Path]]:
         """Get batches of files to process.
@@ -596,19 +607,37 @@ class ROIAreaAnalyzer:
             logger.error(f"Directory not found: {self.input_dir}")
             return pd.DataFrame()
 
+        # Find all pickle files and group them by animal_id and segment_id
         pkl_files = list(self.input_dir.glob("*.pkl"))
         if not pkl_files:
             logger.warning(f"No .pkl files found in {self.input_dir}")
             return pd.DataFrame()
 
-        all_results = []
-        total_batches = (len(pkl_files) + BATCH_SIZE - 1) // BATCH_SIZE
+        # Group files by segment to ensure we process all files for each segment
+        segment_files: Dict[str, List[Path]] = {}
+        for file in pkl_files:
+            try:
+                animal_id, segment_id, _ = self._parse_filename(file.name)
+                key = f"{animal_id}_{segment_id}"
+                if key not in segment_files:
+                    segment_files[key] = []
+                segment_files[key].append(file)
+            except Exception as e:
+                logger.error(f"Error parsing filename {file.name}: {str(e)}")
+                continue
 
-        with tqdm(total=len(pkl_files), desc="Processing ROI files") as pbar:
-            for batch in self._get_file_batches():
-                batch_results = self._process_batch(batch)
-                all_results.extend(batch_results)
-                pbar.update(len(batch))
+        all_results = []
+        total_files = len(pkl_files)
+
+        with tqdm(total=total_files, desc="Processing ROI files") as pbar:
+            # Process files segment by segment
+            for segment_key, files in segment_files.items():
+                for batch in [
+                    files[i : i + BATCH_SIZE] for i in range(0, len(files), BATCH_SIZE)
+                ]:
+                    batch_results = self._process_batch(batch)
+                    all_results.extend(batch_results)
+                    pbar.update(len(batch))
 
         # Create DataFrame and optimize types
         df = pd.DataFrame(all_results)
@@ -644,18 +673,26 @@ class ROIAreaAnalyzer:
             df: DataFrame containing analysis results
 
         Returns:
-            DataFrame containing summary statistics grouped by region
+            DataFrame containing summary statistics grouped by region, aggregating across all segments
         """
         if df is None:
             df = self.analyze_directory()
 
         with tqdm(total=1, desc="Generating region summary") as pbar:
+            # First group by region_name and segment_id to get segment-level stats
+            segment_stats = (
+                df.groupby(["region_name", "segment_id"], observed=True)["area_pixels"]
+                .agg(["sum"])
+                .reset_index()
+            )
+
+            # Then group by region_name to get region-level stats
             summary: DataFrame = (
-                df.groupby("region_name", observed=True)
+                segment_stats.groupby("region_name", observed=True)
                 .agg(
                     {
-                        "area_pixels": [
-                            "count",
+                        "segment_id": "count",  # Count of segments
+                        "sum": [
                             "mean",
                             "std",
                             "min",
@@ -663,25 +700,28 @@ class ROIAreaAnalyzer:
                             lambda x: x.quantile(0.25),
                             lambda x: x.quantile(0.75),
                             "sum",
-                        ]
+                        ],  # Total area across all segments
                     }
                 )
                 .round(2)
             )
-            # Name the columns
+
+            # Flatten column names and rename
             summary.columns = [
-                "count",
-                "mean",
-                "std",
-                "min",
-                "max",
-                "q25",
-                "q75",
+                "segment_count",
+                "mean_area",
+                "std_area",
+                "min_area",
+                "max_area",
+                "q25_area",
+                "q75_area",
                 "total_area",
             ]
-            # Reset index to make region_name the first column
+
+            # Reset index to make region_name a column
             summary = summary.reset_index()
             pbar.update(1)
+
         return summary
 
     def get_summary_by_segment(self, df: Optional[DataFrame] = None) -> DataFrame:
@@ -691,16 +731,26 @@ class ROIAreaAnalyzer:
             df: DataFrame containing analysis results
 
         Returns:
-            DataFrame containing summary statistics grouped by segment
+            DataFrame containing summary statistics grouped by segment, aggregating across all regions
         """
+        if df is None:
+            df = self.analyze_directory()
 
         with tqdm(total=1, desc="Generating segment summary") as pbar:
-            summary: pd.DataFrame = (
-                df.groupby("segment_id", observed=True)
+            # First group by segment_id and region_name to get region-level stats
+            region_stats = (
+                df.groupby(["segment_id", "region_name"], observed=True)["area_pixels"]
+                .agg(["sum"])
+                .reset_index()
+            )
+
+            # Then group by segment_id to get segment-level stats
+            summary: DataFrame = (
+                region_stats.groupby("segment_id", observed=True)
                 .agg(
                     {
-                        "area_pixels": [
-                            "count",
+                        "region_name": "count",  # Count of regions
+                        "sum": [
                             "mean",
                             "std",
                             "min",
@@ -708,32 +758,33 @@ class ROIAreaAnalyzer:
                             lambda x: x.quantile(0.25),
                             lambda x: x.quantile(0.75),
                             "sum",
-                        ]
+                        ],  # Total area across all regions
                     }
                 )
                 .round(2)
-                if df is not None
-                else DataFrame()
             )
-            # Name the columns
+
+            # Flatten column names and rename
             summary.columns = [
-                "count",
-                "mean",
-                "std",
-                "min",
-                "max",
-                "q25",
-                "q75",
+                "region_count",
+                "mean_area",
+                "std_area",
+                "min_area",
+                "max_area",
+                "q25_area",
+                "q75_area",
                 "total_area",
             ]
-            # Reset index to make segment_id the first column
+
+            # Reset index to make segment_id a column
             summary = summary.reset_index()
             pbar.update(1)
+
         return summary
 
     def clear_cache(self) -> None:
         """Clear the internal cache of processed results."""
-        self._cache.clear()
+        self.cache.clear()
         self._parse_filename.cache_clear()
 
     def get_system_info(self) -> Dict[str, Any]:
@@ -827,55 +878,119 @@ class ROIAreaAnalyzer:
         Returns:
             Dictionary mapping animal IDs to their analysis results
         """
-        results: Dict[str, DataFrame] = {}
-        roi_dirs: List[Tuple[Path, str]] = self._find_roi_directories()
+        # Create log file in the root directory
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        input_path = Path(self.input_dir)
+        # Find the root directory (where p3, p6, etc. are located)
+        root_dir = input_path
+        while root_dir.name.startswith(("p ", "p_", "p-", "m_", "m-")):
+            root_dir = root_dir.parent
+        log_file = root_dir / f"area_analysis_log_{timestamp}.txt"
 
-        if not roi_dirs:
-            logger.warning(
-                f"No directories containing valid ROI files found in {self.input_dir}"
-            )
+        # Add file handler for the log file
+        file_handler = logging.FileHandler(log_file)
+        file_handler.setFormatter(
+            logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+        )
+        logger.addHandler(file_handler)
+
+        try:
+            # Initialize total method counts
+            total_method_counts = {"fast": 0, "gpu": 0, "sparse": 0}
+
+            # Log system configuration
+            logger.info("=== Analysis Configuration ===")
+            sys_info = self.get_system_info()
+            for key, value in sys_info.items():
+                logger.info(f"{key}: {value}")
+            logger.info(f"Input directory: {self.input_dir}")
+            logger.info(f"Max workers: {self.max_workers}")
+            logger.info(f"Using GPU: {self.use_gpu}")
+            logger.info("=" * 50)
+
+            results: Dict[str, DataFrame] = {}
+            roi_dirs: List[Tuple[Path, str]] = self._find_roi_directories()
+
+            if not roi_dirs:
+                logger.warning(
+                    f"No directories containing valid ROI files found in {self.input_dir}"
+                )
+                return results
+
+            total_start_time = time.time()
+
+            for dir_path, animal_id in tqdm(roi_dirs, desc="Processing directories"):
+                logger.info(f"\nProcessing directory: {dir_path}")
+                dir_start_time = time.time()
+
+                # Create analysis directory in the parent directory of the ROI files
+                analysis_dir: Path = (
+                    dir_path.parent / f"{animal_id.lower()}_area_analysis"
+                )
+                analysis_dir.mkdir(exist_ok=True)
+
+                # Temporarily set input_dir to current directory
+                original_input_dir: Path = self.input_dir
+                self.input_dir = dir_path
+
+                try:
+                    # Reset method counts for this directory
+                    self.method_counts = {"fast": 0, "gpu": 0, "sparse": 0}
+
+                    # Run analysis
+                    df: pd.DataFrame = self.analyze_directory()
+                    if not df.empty:
+                        results[animal_id] = df
+
+                        # Generate and save summaries
+                        region_summary: DataFrame = self.get_summary_by_region(df)
+                        segment_summary: DataFrame = self.get_summary_by_segment(df)
+
+                        # Save results
+                        df.to_csv(analysis_dir / "detailed_results.csv", index=False)
+                        region_summary.to_csv(
+                            analysis_dir / "region_summary.csv", index=False
+                        )
+                        segment_summary.to_csv(
+                            analysis_dir / "segment_summary.csv", index=False
+                        )
+
+                        # Add this directory's method counts to the total
+                        for method in total_method_counts:
+                            total_method_counts[method] += self.method_counts[method]
+
+                        # Log directory processing summary
+                        dir_time = time.time() - dir_start_time
+                        logger.info(
+                            f"Directory {dir_path} processed in {dir_time:.2f}s"
+                        )
+                        logger.info(f"Files processed: {len(df)}")
+                        logger.info(f"Results saved to: {analysis_dir}")
+
+                except Exception as e:
+                    logger.error(f"Error processing {dir_path}: {str(e)}")
+                    continue
+                finally:
+                    # Restore original input_dir
+                    self.input_dir = original_input_dir
+
+            # Log final summary with total method counts
+            total_time = time.time() - total_start_time
+            logger.info("\n=== Analysis Summary ===")
+            logger.info(f"Total processing time: {total_time:.2f}s")
+            logger.info(f"Total directories processed: {len(roi_dirs)}")
+            logger.info(f"Method usage counts: {total_method_counts}")
+            logger.info("=" * 50)
+
+            # Update the instance method counts with the totals
+            self.method_counts = total_method_counts
+
             return results
 
-        for dir_path, animal_id in tqdm(roi_dirs, desc="Processing directories"):
-            logger.info(f"Processing directory: {dir_path}")
-
-            # Create analysis directory
-            analysis_dir: Path = dir_path.parent / f"{animal_id.lower()}_area_analysis"
-            analysis_dir.mkdir(exist_ok=True)
-
-            # Temporarily set input_dir to current directory
-            original_input_dir: Path = self.input_dir
-            self.input_dir = dir_path
-
-            try:
-                # Run analysis
-                df: pd.DataFrame = self.analyze_directory()
-                if not df.empty:
-                    results[animal_id] = df
-
-                    # Generate and save summaries
-                    region_summary: DataFrame = self.get_summary_by_region(df)
-                    segment_summary: DataFrame = self.get_summary_by_segment(df)
-
-                    # Save results
-                    df.to_csv(analysis_dir / "detailed_results.csv", index=False)
-                    region_summary.to_csv(
-                        analysis_dir / "region_summary.csv", index=False
-                    )
-                    segment_summary.to_csv(
-                        analysis_dir / "segment_summary.csv", index=False
-                    )
-
-                    logger.info(f"Results saved to: {analysis_dir}")
-
-            except Exception as e:
-                logger.error(f"Error processing {dir_path}: {str(e)}")
-                continue
-            finally:
-                # Restore original input_dir
-                self.input_dir = original_input_dir
-
-        return results
+        finally:
+            # Remove the file handler
+            logger.removeHandler(file_handler)
+            file_handler.close()
 
 
 if __name__ == "__main__":
