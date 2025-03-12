@@ -92,5 +92,5 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ## Contact
 
-- **Lab Website**: [Kim Lab - UCSC](https://www.ejkimlab.com/)
+- **Lab Website**: [Kim Neuroscience Lab](https://www.ejkimlab.com/)
 - **GitHub**: [Kim-Neuroscience-Lab](https://github.com/Kim-Neuroscience-Lab)
