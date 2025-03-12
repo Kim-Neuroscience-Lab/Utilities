@@ -12,12 +12,13 @@ This documentation covers the utilities and tools used in the Kim Neuroscience L
    :maxdepth: 2
    :caption: Contents:
 
+   installation
+   usage
    modules/analysis
    modules/core
    modules/utils
    modules/data
    modules/io
-   usage
 
 Overview
 --------

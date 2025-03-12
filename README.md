@@ -62,14 +62,55 @@ For more examples and detailed usage instructions, see the [documentation](https
 
 Full documentation is available at: https://kim-neuroscience-lab.github.io/Utilities/
 
-To build the documentation locally:
+### Building Documentation Locally
+
+1. Install documentation dependencies:
+
+```bash
+pip install sphinx sphinx-rtd-theme myst-parser
+```
+
+2. Build the HTML documentation:
 
 ```bash
 cd docs
 make html
 ```
 
-Then open `docs/build/html/index.html` in your web browser.
+3. View the documentation:
+
+Option 1 - Using Python's built-in server:
+
+```bash
+cd build/html
+python -m http.server 8000
+```
+
+Then open http://127.0.0.1:8000 in your web browser
+
+Option 2 - Direct file access:
+
+```bash
+# macOS
+open build/html/index.html
+
+# Linux
+xdg-open build/html/index.html
+
+# Windows
+start build/html/index.html
+```
+
+### Updating Documentation
+
+The documentation source files are in `docs/source/`:
+
+- `index.rst`: Main documentation page
+- `installation.rst`: Installation guide
+- `usage.rst`: Usage instructions
+- `modules/*.rst`: Module-specific documentation
+
+After making changes, rebuild the documentation using `make html` in the `docs` directory.
 
 ## Project Structure
 
@@ -82,6 +123,8 @@ Utilities/
 │   ├── io/            # Input/output operations
 │   └── utils/         # General utility functions
 ├── docs/              # Documentation
+│   ├── source/        # Documentation source files
+│   └── build/html/    # Built documentation
 ├── tests/             # Test suite
 └── scripts/           # Command-line tools and scripts
 ```
