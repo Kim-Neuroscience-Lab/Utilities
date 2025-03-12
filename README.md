@@ -2,8 +2,6 @@
 
 A collection of computational tools and utilities used in the Kim Neuroscience Lab for data analysis and processing.
 
-[![Documentation Status](https://github.com/Kim-Neuroscience-Lab/Utilities/workflows/Documentation/badge.svg)](https://kim-neuroscience-lab.github.io/Utilities/)
-
 ## Features
 
 - **ROI Area Analysis**: Compute and analyze areas of regions of interest from pickle files
