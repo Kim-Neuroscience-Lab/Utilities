@@ -10,6 +10,10 @@ from src.utils.hardware import (
     get_system_info,
 )
 from src.utils.logging import get_logger, setup_logging
+from src.utils.visualization import (
+    plot_umap_and_confusion_matrix,
+    plot_vertical_distribution,
+)
 
 __all__ = [
     # Hardware
@@ -20,4 +24,7 @@ __all__ = [
     # Logging
     "get_logger",
     "setup_logging",
+    # Visualization
+    "plot_umap_and_confusion_matrix",
+    "plot_vertical_distribution",
 ]

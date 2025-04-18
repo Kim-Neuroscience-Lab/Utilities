@@ -137,3 +137,189 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 - **Lab Website**: [Kim Neuroscience Lab](https://www.ejkimlab.com/)
 - **GitHub**: [Kim-Neuroscience-Lab](https://github.com/Kim-Neuroscience-Lab)
+
+# Neuroscience Data Utilities
+
+A collection of utilities for processing neuroscience data, focusing on data imputation and analysis.
+
+## Imputation Utilities
+
+The package provides several imputation methods for handling missing data in neuroscience datasets.
+
+### KNN Imputation
+
+The KNN (K-Nearest Neighbors) imputation method replaces missing values with the weighted average of the K nearest neighbors in the feature space.
+
+#### Command-line Usage
+
+```bash
+# Basic usage with default parameters
+python -m src.scripts.impute_by_knn --input data/raw/mice_data_vsv_h2b.csv --output data/processed/mice_data_imputed.csv
+
+# Advanced usage with custom parameters
+python -m src.scripts.impute_by_knn \
+  --input data/raw/mice_data_vsv_h2b.csv \
+  --output data/processed/mice_data_imputed.csv \
+  --neighbors 3 \
+  --weights distance \
+  --metric nan_euclidean \
+  --class-column age_categorical \
+  --separate-imputation \
+  --verbose
+
+# With visualization (auto-saves in the same directory as output)
+python -m src.scripts.impute_by_knn \
+  --input data/raw/mice_data_vsv_h2b.csv \
+  --plot
+
+# Save visualization to a specific file
+python -m src.scripts.impute_by_knn \
+  --input data/raw/mice_data_vsv_h2b.csv \
+  --save-plot figures/imputed_data_visualization.png
+```
+
+#### Available Options
+
+- `--input`, `-i`: Path to input CSV file (required)
+- `--output`, `-o`: Path to output CSV file (default: input_imputed.csv)
+- `--neighbors`, `-n`: Number of neighbors to use (default: 5)
+- `--weights`, `-w`: Weight function used in prediction (choices: uniform, distance; default: uniform)
+- `--metric`, `-m`: Distance metric for the tree (default: nan_euclidean)
+- `--exclude`, `-e`: Columns to exclude from imputation (default: Age age_categorical Animal)
+- `--include`: Columns to include in imputation (if specified, only these columns will be imputed)
+- `--class-column`, `-c`: Column to use for class-based imputation (e.g., age_categorical)
+- `--separate-imputation`, `-s`: Perform separate imputation for each class
+- `--no-preprocess`: Skip preprocessing numeric columns
+- `--random-state`: Random state for reproducibility (default: 137)
+- `--verbose`, `-v`: Enable verbose output
+- `--plot`, `-p`: Plot the imputed data as a heatmap with red outlines around imputed values
+- `--save-plot`: Save the plot to the specified path instead of displaying it
+
+### MICE Imputation
+
+Multiple Imputation by Chained Equations (MICE) is an advanced imputation method that imputes missing values by modeling each feature with missing values as a function of other features.
+
+```bash
+# Basic usage
+python -m scripts.impute_by_mice data/raw/mice_data_vsv_h2b.csv
+
+# With visualization
+python -m scripts.impute_by_mice data/raw/mice_data_vsv_h2b.csv --plot
+
+# With custom settings
+python -m scripts.impute_by_mice data/raw/mice_data_vsv_h2b.csv \
+  --max-iterations 20 \
+  --strategy median \
+  --exclude-columns Age Animal \
+  --verbose
+```
+
+### Example: Impute by Age Group
+
+To impute missing values separately for each age group:
+
+```bash
+python -m src.scripts.impute_by_knn \
+  --input data/raw/mice_data_vsv_h2b.csv \
+  --output data/processed/mice_data_age_imputed.csv \
+  --class-column age_categorical \
+  --separate-imputation
+```
+
+### Example: Impute Only vsvQUANT Columns
+
+To impute only columns containing "vsvQUANT" in their name:
+
+```bash
+python -m src.scripts.impute_by_knn \
+  --input data/raw/mice_data_vsv_h2b.csv \
+  --output data/processed/mice_data_vsv_imputed.csv \
+  --include $(grep -o "vsvQUANT[^,]*" data/raw/mice_data_vsv_h2b.csv | head -1)
+```
+
+### Example: Visualize Imputed Data
+
+Both imputation methods now support advanced visualization with red outlines highlighting imputed values:
+
+```bash
+# KNN imputation with visualization
+python -m src.scripts.impute_by_knn \
+  --input data/raw/mice_data_vsv_h2b.csv \
+  --class-column age_categorical \
+  --plot
+
+# MICE imputation with visualization
+python -m scripts.impute_by_mice data/raw/mice_data_vsv_h2b.csv --plot
+```
+
+## Python API Usage
+
+You can also use the imputation classes directly in your Python code:
+
+```python
+import pandas as pd
+import matplotlib.pyplot as plt
+import numpy as np
+from src.data.imputation import KNNImputerService, KNNImputerConfig
+
+# Load data
+data = pd.read_csv("data/raw/mice_data_vsv_h2b.csv")
+
+# Store original missing value mask
+missing_mask = data.isna()
+
+# Configure KNN imputation
+config = KNNImputerConfig(
+    n_neighbors=3,
+    weights="distance",
+    exclude_columns=["Age", "age_categorical", "Animal"],
+    class_column="age_categorical",
+    separate_imputation=True
+)
+
+# Create imputer and process data
+imputer = KNNImputerService(config)
+imputed_data = imputer.impute(data)
+
+# Get statistics about the imputation
+stats = imputer.get_imputation_statistics()
+print(f"Total missing values: {stats['total_missing_values']}")
+
+# Save results
+imputed_data.to_csv("data/processed/imputed_data.csv", index=False)
+
+# Visualize the results with red outlines for imputed values
+# Get numeric columns
+numeric_cols = imputed_data.select_dtypes(include=["number"]).columns.tolist()
+numeric_df = imputed_data[numeric_cols]
+numeric_missing_mask = missing_mask[numeric_cols]
+
+# Scale data for better visualization
+scaled_df = (numeric_df - numeric_df.min(axis=0)) / (numeric_df.max(axis=0) - numeric_df.min(axis=0))
+
+# Create heatmap
+plt.figure(figsize=(12, 8))
+plt.imshow(scaled_df.to_numpy(), aspect='auto', cmap='viridis')
+plt.colorbar(label='Normalized Value')
+
+# Highlight imputed values with red outlines
+for i in range(len(numeric_df)):
+    for j, col in enumerate(numeric_cols):
+        if numeric_missing_mask.iloc[i, numeric_missing_mask.columns.get_loc(col)]:
+            rect = plt.Rectangle(
+                (j - 0.5, i - 0.5),
+                1, 1,
+                fill=False,
+                edgecolor='red',
+                linewidth=1.5
+            )
+            plt.gca().add_patch(rect)
+
+plt.xlabel('Features')
+plt.ylabel('Samples')
+plt.title('Imputed Data Visualization (Red outline = imputed value)')
+plt.xticks(range(len(numeric_cols)), numeric_cols, rotation=90)
+plt.tight_layout()
+plt.savefig("figures/imputed_data_with_highlights.png")
+plt.show()
+```
